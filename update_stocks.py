@@ -29,22 +29,22 @@ def main():
     market_date = now_tw.strftime("%Y-%m-%d")
     inst_map = {}
 
-    # 1. 抓取證交所三大法人明細（拆解外資、投信、自營商與合計大戶買賣超）
+    # 1. 抓取證交所三大法人明細（外資、投信、合計）
     try:
-        for row in fetch_json("https://twse.com.tw"):
+        t86_data = fetch_json("https://twse.com.tw")
+        for row in t86_data:
             code = str(row.get("Code", "")).strip()
             foreign_net = parse_lots(row.get("ForeignInvestorsNetBuySell", 0))
             trust_net = parse_lots(row.get("InvestmentTrustNetBuySell", 0))
             total_net = parse_lots(row.get("TotalInstitutionalInvestorsNetBuySell", 0))
-            inst_map[code] = {
-                "foreign": foreign_net,
-                "trust": trust_net,
-                "total": total_net
-            }
-    except Exception as e:
-        print("三大法人資料暫無更新:", e)
+            if foreign_net != 0 or trust_net != 0 or total_net != 0:
+                inst_map[code] = {"foreign": foreign_net, "trust": trust_net, "total": total_net}
+    except Exception:
+        pass
 
-    # 2. 抓取證交所全市場上市行情並結合籌碼初篩
+    has_t86_today = len(inst_map) > 50  # 判斷證交所是否已公佈今日三大法人
+
+    # 2. 抓取證交所全市場上市行情
     try:
         twse_data = fetch_json("https://twse.com.tw")
         for item in twse_data:
@@ -67,13 +67,10 @@ def main():
                 pct_change = round((change_p / prev_close) * 100, 2) if prev_close > 0 else 0
 
                 chip = inst_map.get(code, {"foreign": 0, "trust": 0, "total": 0})
-                
-                # 排除法人大舉倒貨（賣超超過 1500 張）的股票，避免拉高出貨陷阱
-                if chip["total"] < -1500:
+                if has_t86_today and chip["total"] < -1500:
                     continue
 
-                # 收紅K且成交量 >= 1000 張進入技術指標精算
-                if close_p >= open_p and pct_change >= 0 and vol_lots >= 1000:
+                if close_p >= open_p and pct_change >= 0.3 and vol_lots >= 1200:
                     candidates.append({
                         "code": code, "name": name, "close": close_p,
                         "pct": pct_change, "vol": vol_lots,
@@ -83,8 +80,8 @@ def main():
                     })
             except Exception:
                 continue
-    except Exception as e:
-        print("證交所行情抓取異常:", e)
+    except Exception:
+        pass
 
     # 備援熱門觀察池
     if not candidates:
@@ -107,9 +104,8 @@ def main():
                 "foreign_net": chip["foreign"], "trust_net": chip["trust"], "inst_net": chip["total"]
             })
 
-    # 優先排序：有法人大戶買超 ＋ 成交量活躍的標的優先進行歷史 K 線精算
-    candidates.sort(key=lambda x: (x["inst_net"] > 300, x["vol"], x["pct"]), reverse=True)
-    top_candidates = candidates[:65]
+    candidates.sort(key=lambda x: (x["inst_net"] > 200, x["vol"], x["pct"]), reverse=True)
+    top_candidates = candidates[:60]
 
     start_date = (now_tw - timedelta(days=100)).strftime("%Y-%m-%d")
     zhu_lin_picks = []
@@ -151,35 +147,42 @@ def main():
             prev_ma5 = sum(closes[-6:-1]) / 5
             prev_ma20 = sum(closes[-21:-1]) / 20
             vol_ma5 = sum(vols[-6:-1]) / 5 if len(vols) >= 6 else curr_v
+            vol_ratio = round(curr_v / vol_ma5, 1) if vol_ma5 > 0 else 1.0
 
             variance = sum((p - ma20) ** 2 for p in closes[-20:]) / 20
             std20 = math.sqrt(variance)
             bb_upper = ma20 + 2 * std20
 
-            # 建立外資 / 投信 / 大戶籌碼標籤
             chip_tags = []
             f_net = stock["foreign_net"]
             t_net = stock["trust_net"]
             tot_net = stock["inst_net"]
 
-            if f_net > 0 and t_net > 0 and (f_net + t_net) >= 300:
-                chip_tags.append("土洋同步買超")
-            if f_net >= 500:
-                chip_tags.append(f"外資大買{int(f_net)}張")
-            elif f_net >= 150:
-                chip_tags.append(f"外資買超{int(f_net)}張")
-            if t_net >= 100:
-                chip_tags.append(f"投信認養{int(t_net)}張")
-            if tot_net >= 800:
-                chip_tags.append(f"法人大戶掃貨{int(tot_net)}張")
+            if has_t86_today:
+                if f_net > 0 and t_net > 0 and (f_net + t_net) >= 200:
+                    chip_tags.append("土洋同步買超")
+                if f_net >= 300:
+                    chip_tags.append(f"外資大買{int(f_net)}張")
+                elif f_net > 0:
+                    chip_tags.append(f"外資買超{int(f_net)}張")
+                if t_net >= 50:
+                    chip_tags.append(f"投信認養{int(t_net)}張")
+                if tot_net >= 500:
+                    chip_tags.append(f"法人大戶掃貨{int(tot_net)}張")
+                # 法人資料已公佈時：要求外資、投信或三大法人至少有一方站在買方（或量能大增主力進場）
+                if f_net <= 0 and t_net <= 0 and tot_net <= 0 and vol_ratio < 1.5:
+                    continue
+            else:
+                # 若盤後法人明細尚未釋出，改用「量比 >= 1.2 倍」偵測主力大戶資金進場
+                if vol_ratio >= 1.5:
+                    chip_tags.append(f"主力爆量{vol_ratio}倍")
+                elif vol_ratio >= 1.15:
+                    chip_tags.append(f"資金溫和放大{vol_ratio}倍")
+                else:
+                    continue
 
-            # 籌碼過濾條件：必須具備「外資買超 > 100張」或「投信買超 > 50張」或「三大法人合計買超 > 200張」
-            has_big_player = (f_net >= 100) or (t_net >= 50) or (tot_net >= 200)
-            if not has_big_player:
-                continue
-
-            # 【策略 A：朱家泓 / 林穎 ＋ 大戶籌碼】站上 5MA 與 20MA 多頭起漲，且量增
-            if curr_c >= ma5 and curr_c >= ma20 and curr_v >= vol_ma5 * 1.05:
+            # 【策略 A：朱家泓 / 林穎】站上 5MA 與 20MA 多頭起漲
+            if curr_c >= ma5 and curr_c >= ma20:
                 z_tags = list(chip_tags) + ["站穩月線多頭"]
                 if curr_c > ma10 and prev_c <= ma10:
                     z_tags.append("一陽穿三線")
@@ -189,7 +192,7 @@ def main():
                     z_tags.append("季線之上")
                 zhu_lin_picks.append({**stock, "ma5": round(ma5, 2), "ma20": round(ma20, 2), "tags": z_tags})
 
-            # 【策略 B：莎拉形態學 ＋ 大戶籌碼】5MA/20MA 金包銀多頭結構，站穩布林中軌之上
+            # 【策略 B：莎拉形態學】5MA/20MA 金包銀多頭結構 + 布林中軌之上
             if ma5 >= ma20 and curr_c >= ma20:
                 s_tags = list(chip_tags) + ["5MA/20MA金包銀"]
                 if prev_ma5 <= prev_ma20:
@@ -201,12 +204,12 @@ def main():
         except Exception:
             continue
 
-    # 排序：法人買超張數越多、漲幅越強排越前面
     zhu_lin_picks.sort(key=lambda x: (x["inst_net"], x["pct"]), reverse=True)
     sarah_picks.sort(key=lambda x: (x["inst_net"], x["pct"]), reverse=True)
 
+    chip_status = "三大法人籌碼已同步" if has_t86_today else "盤中/盤後量能主力偵測中"
     output = {
-        "updated_at": f"{market_date} (系統更新 {now_tw.strftime('%H:%M')})",
+        "updated_at": f"{market_date} (系統更新 {now_tw.strftime('%H:%M')} · {chip_status})",
         "zhu_lin_picks": zhu_lin_picks[:10],
         "sarah_picks": sarah_picks[:10]
     }

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>專屬台股技術與籌碼決策站</title>
+  <style>
+    :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --red: #ef4444; --green: #22c55e; --gold: #f59e0b; --accent: #3b82f6; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 16px; }
+    .container { max-width: 800px; margin: 0 auto; }
+    header { text-align: center; padding: 16px 0; border-bottom: 1px solid #334155; margin-bottom: 20px; }
+    h1 { font-size: 1.4rem; margin: 0 0 8px 0; color: #fff; }
+    .meta { font-size: 0.85rem; color: var(--muted); }
+    .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+    .tab-btn { flex: 1; padding: 12px; border: none; border-radius: 10px; background: var(--card); color: var(--muted); font-size: 0.95rem; font-weight: bold; cursor: pointer; transition: 0.2s; }
+    .tab-btn.active { background: var(--accent); color: #fff; }
+    .card { background: var(--card); border-radius: 12px; padding: 16px; margin-bottom: 14px; border: 1px solid #334155; }
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .stock-title { font-size: 1.2rem; font-weight: bold; }
+    .stock-code { color: var(--gold); margin-right: 6px; }
+    .price-box { text-align: right; }
+    .price { font-size: 1.25rem; font-weight: bold; color: var(--red); }
+    .pct { font-size: 0.85rem; background: rgba(239, 68, 68, 0.2); color: #fca5a5; padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; background: #0f172a; padding: 10px; border-radius: 8px; font-size: 0.85rem; margin-bottom: 10px; text-align: center; }
+    .metrics span { display: block; color: var(--muted); font-size: 0.75rem; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { font-size: 0.78rem; padding: 4px 8px; border-radius: 6px; background: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.4); }
+    .tag.gold { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border-color: rgba(245, 158, 11, 0.4); }
+    .empty { text-align: center; padding: 40px 20px; color: var(--muted); }
+    .link-btn { display: inline-block; margin-top: 10px; font-size: 0.8rem; color: #60a5fa; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📈 專屬台股技術與籌碼決策站</h1>
+      <div class="meta" id="update-time">資料載入中...</div>
+    </header>
+
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('zhu', this)">🔥 朱家泓/林穎：底部起漲</button>
+      <button class="tab-btn" onclick="switchTab('sarah', this)">✨ 莎拉形態：布林金包銀</button>
+    </div>
+
+    <div id="stock-list"></div>
+  </div>
+
+  <script>
+    let stockData = { zhu_lin_picks: [], sarah_picks: [] };
+    let currentTab = 'zhu';
+
+    async function loadData() {
+      try {
+        const res = await fetch('./recommendations.json?t=' + new Date().getTime());
+        if (!res.ok) throw new Error('尚未產生推薦名單，請先至 GitHub Actions 執行排程');
+        stockData = await res.json();
+        document.getElementById('update-time').innerText = `最後自動更新：${stockData.updated_at}（零幻覺真實盤後運算）`;
+        renderList();
+      } catch (err) {
+        document.getElementById('stock-list').innerHTML = `<div class="empty">⚠️ ${err.message}</div>`;
+      }
+    }
+
+    function switchTab(tab, btn) {
+      currentTab = tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderList();
+    }
+
+    function renderList() {
+      const listEl = document.getElementById('stock-list');
+      const items = currentTab === 'zhu' ? stockData.zhu_lin_picks : stockData.sarah_picks;
+
+      if (!items || items.length === 0) {
+        listEl.innerHTML = `<div class="empty">今日盤後篩選暫無完全符合此嚴格條件的標的（寧缺勿濫，嚴守紀律）。</div>`;
+        return;
+      }
+
+      listEl.innerHTML = items.map(s => `
+        <div class="card">
+          <div class="card-header">
+            <div class="stock-title"><span class="stock-code">${s.code}</span>${s.name}</div>
+            <div class="price-box">
+              <span class="price">${s.close}</span>
+              <span class="pct">+${s.pct}%</span>
+            </div>
+          </div>
+          <div class="metrics">
+            <div><span>成交張數</span>${s.vol.toLocaleString()} 張</div>
+            <div><span>5日均線 (5MA)</span>${s.ma5}</div>
+            <div><span>20日均線 (月線)</span>${s.ma20}</div>
+          </div>
+          <div class="tags">
+            ${s.tags.map(t => `<span class="tag ${t.includes('金包銀') || t.includes('三線') ? 'gold' : ''}">#${t}</span>`).join('')}
+          </div>
+          <a class="link-btn" href="https://yahoo.com{s.code}.TW/technical-analysis" target="_blank">👉 查看 Yahoo 股市即時 K 線圖</a>
+        </div>
+      `).join('');
+    }
+
+    loadData();
+  </script>
+</body>
+</html>

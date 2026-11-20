@@ -18,8 +18,26 @@ def fetch_json(url):
     with urllib.request.urlopen(req, context=ctx, timeout=20) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
+def parse_lots(val):
+    s = str(val or "0").replace(",", "").strip()
+    if not s or s == "--":
+        return 0
+    return round(int(float(s)) / 1000, 1)
+
 def main():
-    # 台股主流與熱門核心觀察池（涵蓋半導體、AI、重電、航運、金融、電子零組件）
+    # 先抓證交所當日三大法人買賣超（外資、投信、合計）
+    inst_map = {}
+    try:
+        for row in fetch_json("https://twse.com.tw"):
+            code = str(row.get("Code", "")).strip()
+            inst_map[code] = {
+                "foreign": parse_lots(row.get("ForeignInvestorsNetBuySell", 0)),
+                "trust": parse_lots(row.get("InvestmentTrustNetBuySell", 0)),
+                "total": parse_lots(row.get("TotalInstitutionalInvestorsNetBuySell", 0))
+            }
+    except Exception:
+        pass
+
     watch_list = [
         ("2330","台積電"),("2317","鴻海"),("2454","聯發科"),("2382","廣達"),("3231","緯創"),
         ("2308","台達電"),("2303","聯電"),("3711","日月光投控"),("2357","華碩"),("2376","技嘉"),
@@ -41,7 +59,6 @@ def main():
     scanned_count = 0
 
     for code, name in watch_list:
-        # 直接向 Yahoo Finance 抓取真實 3 個月日 K 線（全球 CDN 節點，永不被封鎖）
         yf_url = f"https://yahoo.com{code}.TW?range=3mo&interval=1d"
         try:
             res = fetch_json(yf_url)
@@ -49,7 +66,6 @@ def main():
             timestamps = result["timestamp"]
             quote = result["indicators"]["quote"][0]
             
-            # 過濾掉空值
             valid_bars = []
             for i in range(len(timestamps)):
                 c = quote["close"][i]
@@ -66,8 +82,8 @@ def main():
             last_ts = valid_bars[-1][0]
             market_date = datetime.fromtimestamp(last_ts, tz=tw_tz).strftime("%Y-%m-%d")
 
-            closes = [b[2] for b in valid_bars]
             opens = [b[1] for b in valid_bars]
+            closes = [b[2] for b in valid_bars]
             lows = [b[3] for b in valid_bars]
             vols = [b[4] for b in valid_bars]
 
@@ -91,12 +107,19 @@ def main():
             std20 = math.sqrt(variance)
             bb_upper = ma20 + 2 * std20
 
-            # 籌碼與量能主力標籤
+            # 結合三大法人籌碼 + 主力爆量標籤
+            chip = inst_map.get(code, {"foreign": 0, "trust": 0, "total": 0})
             chip_tags = []
-            if vol_ratio >= 1.5:
+            if chip["foreign"] > 0 and chip["trust"] > 0:
+                chip_tags.append("土洋同步買超")
+            if chip["foreign"] >= 300:
+                chip_tags.append(f"外資大買{int(chip['foreign'])}張")
+            elif chip["foreign"] > 0:
+                chip_tags.append(f"外資買超{int(chip['foreign'])}張")
+            if chip["trust"] >= 50:
+                chip_tags.append(f"投信認養{int(chip['trust'])}張")
+            if vol_ratio >= 1.4:
                 chip_tags.append(f"主力爆量{vol_ratio}倍")
-            elif vol_ratio >= 1.1:
-                chip_tags.append(f"量增主力進場{vol_ratio}倍")
 
             # 【策略 A：朱家泓 / 林穎】收紅K + 站上 5MA 與 20MA 多頭起漲
             if curr_c >= curr_o and curr_c >= ma5 and curr_c >= ma20:
@@ -110,7 +133,7 @@ def main():
                 zhu_lin_picks.append({
                     "code": code, "name": name, "close": round(curr_c, 2),
                     "pct": pct, "vol": curr_v, "ma5": round(ma5, 2), "ma20": round(ma20, 2),
-                    "tags": z_tags
+                    "inst_net": chip["total"], "tags": z_tags
                 })
 
             # 【策略 B：莎拉形態學】5MA(金) >= 20MA(銀) 金包銀多頭結構 + 站穩布林中軌之上
@@ -123,14 +146,14 @@ def main():
                 sarah_picks.append({
                     "code": code, "name": name, "close": round(curr_c, 2),
                     "pct": pct, "vol": curr_v, "ma5": round(ma5, 2), "ma20": round(ma20, 2),
-                    "tags": s_tags
+                    "inst_net": chip["total"], "tags": s_tags
                 })
 
         except Exception:
             continue
 
-    zhu_lin_picks.sort(key=lambda x: x["pct"], reverse=True)
-    sarah_picks.sort(key=lambda x: x["pct"], reverse=True)
+    zhu_lin_picks.sort(key=lambda x: (x["inst_net"] > 0, x["pct"]), reverse=True)
+    sarah_picks.sort(key=lambda x: (x["inst_net"] > 0, x["pct"]), reverse=True)
 
     output = {
         "updated_at": f"{market_date} (已精算 {scanned_count} 檔 · 更新 {now_tw.strftime('%H:%M')})",

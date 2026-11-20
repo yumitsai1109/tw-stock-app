@@ -95,6 +95,7 @@ jobs:
               ("3035","智原"),("3529","力旺"),("5269","祥碩"),("6415","矽力*-KY"),("2360","致茂")
           ]
 
+          all_analyzed = []
           zhu_lin_picks = []
           sarah_picks = []
           market_date = now_tw.strftime("%Y-%m-%d")
@@ -112,7 +113,7 @@ jobs:
               vols = [b[4] for b in bars]
 
               curr_c, curr_o, prev_c, curr_v = closes[-1], opens[-1], closes[-2], vols[-1]
-              if curr_v < 800 or prev_c <= 0:
+              if curr_v < 500 or prev_c <= 0:
                   continue
 
               pct = round(((curr_c - prev_c) / prev_c) * 100, 2)
@@ -132,17 +133,23 @@ jobs:
               elif vol_ratio >= 1.1:
                   chip_tags.append(f"量增攻擊{vol_ratio}倍")
 
+              base_item = {
+                  "code": code, "name": name, "close": round(curr_c, 2),
+                  "pct": pct, "vol": curr_v, "ma5": round(ma5, 2), "ma20": round(ma20, 2),
+                  "tags": list(chip_tags)
+              }
+              all_analyzed.append((base_item, curr_c, curr_o, prev_c, ma5, ma10, ma20, prev_ma5, prev_ma20, bb_upper, lows))
+
+              # 條件 1：嚴格站穩月線 20MA 多頭
               if curr_c >= ma20 and (curr_c >= ma5 or curr_c >= curr_o):
                   z_tags = list(chip_tags) + ["站穩月線多頭"]
                   if curr_c > ma10 and prev_c <= ma10:
                       z_tags.append("一陽穿三線")
                   if min(lows[-5:]) >= min(lows[-15:-5]):
                       z_tags.append("底底高結構")
-                  zhu_lin_picks.append({
-                      "code": code, "name": name, "close": round(curr_c, 2),
-                      "pct": pct, "vol": curr_v, "ma5": round(ma5, 2), "ma20": round(ma20, 2),
-                      "tags": z_tags
-                  })
+                  item_z = dict(base_item)
+                  item_z["tags"] = z_tags
+                  zhu_lin_picks.append(item_z)
 
               if ma5 >= ma20 and curr_c >= ma20:
                   s_tags = list(chip_tags) + ["5MA/20MA金包銀"]
@@ -150,12 +157,49 @@ jobs:
                       s_tags.append("剛黃金交叉")
                   if curr_c >= bb_upper * 0.95:
                       s_tags.append("沿2倍布林上軌強攻")
-                  sarah_picks.append({
-                      "code": code, "name": name, "close": round(curr_c, 2),
-                      "pct": pct, "vol": curr_v, "ma5": round(ma5, 2), "ma20": round(ma20, 2),
-                      "tags": s_tags
-                  })
+                  item_s = dict(base_item)
+                  item_s["tags"] = s_tags
+                  sarah_picks.append(item_s)
               time.sleep(0.08)
+
+          # 若大盤拉回導致嚴格站上月線不足 5 檔，自動補入「站穩5MA短多 / 盤勢抗跌強勢股」
+          if len(zhu_lin_picks) < 5 and all_analyzed:
+              existing_z = {x["code"] for x in zhu_lin_picks}
+              sorted_by_pct = sorted(all_analyzed, key=lambda t: t[0]["pct"], reverse=True)
+              for base_item, curr_c, curr_o, prev_c, ma5, ma10, ma20, prev_ma5, prev_ma20, bb_upper, lows in sorted_by_pct:
+                  if base_item["code"] in existing_z:
+                      continue
+                  item_z = dict(base_item)
+                  extra_tags = list(item_z["tags"])
+                  if curr_c >= ma5:
+                      extra_tags.append("站上5MA短多反彈")
+                  if curr_c >= curr_o:
+                      extra_tags.append("逆勢收紅K抗跌")
+                  else:
+                      extra_tags.append("大盤修正相對抗跌")
+                  item_z["tags"] = extra_tags
+                  zhu_lin_picks.append(item_z)
+                  if len(zhu_lin_picks) >= 10:
+                      break
+
+          if len(sarah_picks) < 5 and all_analyzed:
+              existing_s = {x["code"] for x in sarah_picks}
+              sorted_by_pct = sorted(all_analyzed, key=lambda t: t[0]["pct"], reverse=True)
+              for base_item, curr_c, curr_o, prev_c, ma5, ma10, ma20, prev_ma5, prev_ma20, bb_upper, lows in sorted_by_pct:
+                  if base_item["code"] in existing_s:
+                      continue
+                  item_s = dict(base_item)
+                  extra_tags = list(item_s["tags"])
+                  if ma5 >= ma20:
+                      extra_tags.append("5MA仍在20MA之上")
+                  elif curr_c >= ma5:
+                      extra_tags.append("站回5MA生命線")
+                  else:
+                      extra_tags.append("回測均線觀察支撐")
+                  item_s["tags"] = extra_tags
+                  sarah_picks.append(item_s)
+                  if len(sarah_picks) >= 10:
+                      break
 
           zhu_lin_picks.sort(key=lambda x: x["pct"], reverse=True)
           sarah_picks.sort(key=lambda x: x["pct"], reverse=True)

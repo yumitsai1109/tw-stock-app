@@ -13,7 +13,7 @@ now_tw = datetime.now(tw_tz)
 
 def fetch_json(url):
     req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     })
     with urllib.request.urlopen(req, context=ctx, timeout=20) as resp:
         return json.loads(resp.read().decode('utf-8'))
@@ -24,8 +24,12 @@ def parse_lots(val):
         return 0
     return round(int(float(s)) / 1000, 1)
 
+def first_item(seq):
+    for x in seq:
+        return x
+    return None
+
 def main():
-    # 先抓證交所當日三大法人買賣超（外資、投信、合計）
     inst_map = {}
     try:
         for row in fetch_json("https://twse.com.tw"):
@@ -62,30 +66,38 @@ def main():
         yf_url = f"https://yahoo.com{code}.TW?range=3mo&interval=1d"
         try:
             res = fetch_json(yf_url)
-            result = res["chart"]["result"][0]
-            timestamps = result["timestamp"]
-            quote = result["indicators"]["quote"][0]
-            
+            result = first_item(res.get("chart", {}).get("result", []))
+            if not result:
+                continue
+            timestamps = result.get("timestamp", [])
+            quote = first_item(result.get("indicators", {}).get("quote", []))
+            if not quote:
+                continue
+
+            raw_opens = quote.get("open", [])
+            raw_closes = quote.get("close", [])
+            raw_lows = quote.get("low", [])
+            raw_vols = quote.get("volume", [])
+
             valid_bars = []
-            for i in range(len(timestamps)):
-                c = quote["close"][i]
-                o = quote["open"][i]
-                l = quote["low"][i]
-                v = quote["volume"][i]
-                if c is not None and o is not None and l is not None and v is not None:
-                    valid_bars.append((timestamps[i], float(o), float(c), float(l), int(v) // 1000))
-            
+            for ts, o, c, l, v in zip(timestamps, raw_opens, raw_closes, raw_lows, raw_vols):
+                if o is not None and c is not None and l is not None and v is not None:
+                    valid_bars.append((ts, float(o), float(c), float(l), int(v) // 1000))
+
             if len(valid_bars) < 25:
                 continue
 
             scanned_count += 1
-            last_ts = valid_bars[-1][0]
+            last_bar = valid_bars[-1]
+            market_date = datetime.fromtimestamp(last_bar.index(last_bar), tz=tw_tz).strftime("%Y-%m-%d")
+            # 直接用解包取得最後一筆時間戳
+            last_ts, _, _, _, _ = valid_bars[-1]
             market_date = datetime.fromtimestamp(last_ts, tz=tw_tz).strftime("%Y-%m-%d")
 
-            opens = [b[1] for b in valid_bars]
-            closes = [b[2] for b in valid_bars]
-            lows = [b[3] for b in valid_bars]
-            vols = [b[4] for b in valid_bars]
+            opens = [o for _, o, _, _, _ in valid_bars]
+            closes = [c for _, _, c, _, _ in valid_bars]
+            lows = [l for _, _, _, l, _ in valid_bars]
+            vols = [v for _, _, _, _, v in valid_bars]
 
             curr_c = closes[-1]
             curr_o = opens[-1]
@@ -97,7 +109,7 @@ def main():
             ma10 = sum(closes[-10:]) / 10
             ma20 = sum(closes[-20:]) / 20
             ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else ma20
-            
+
             prev_ma5 = sum(closes[-6:-1]) / 5
             prev_ma20 = sum(closes[-21:-1]) / 20
             vol_ma5 = sum(vols[-6:-1]) / 5 if len(vols) >= 6 else curr_v
@@ -107,7 +119,6 @@ def main():
             std20 = math.sqrt(variance)
             bb_upper = ma20 + 2 * std20
 
-            # 結合三大法人籌碼 + 主力爆量標籤
             chip = inst_map.get(code, {"foreign": 0, "trust": 0, "total": 0})
             chip_tags = []
             if chip["foreign"] > 0 and chip["trust"] > 0:
@@ -118,7 +129,7 @@ def main():
                 chip_tags.append(f"外資買超{int(chip['foreign'])}張")
             if chip["trust"] >= 50:
                 chip_tags.append(f"投信認養{int(chip['trust'])}張")
-            if vol_ratio >= 1.4:
+            if vol_ratio >= 1.3:
                 chip_tags.append(f"主力爆量{vol_ratio}倍")
 
             # 【策略 A：朱家泓 / 林穎】收紅K + 站上 5MA 與 20MA 多頭起漲

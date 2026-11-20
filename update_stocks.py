@@ -4,7 +4,6 @@ import json
 import math
 from datetime import datetime, timedelta, timezone
 
-# 忽略證交所 SSL 憑證驗證問題（解決雲端主機連線失敗）
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
@@ -19,27 +18,35 @@ def fetch_json(url):
     with urllib.request.urlopen(req, context=ctx, timeout=25) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
+def parse_lots(val):
+    s = str(val or "0").replace(",", "").strip()
+    if not s or s == "--":
+        return 0
+    return round(int(float(s)) / 1000, 1)
+
 def main():
-    print(f"[{now_tw.strftime('%Y-%m-%d %H:%M:%S')}] 開始執行台股選股引擎...")
     candidates = []
     market_date = now_tw.strftime("%Y-%m-%d")
+    inst_map = {}
 
-    # 嘗試從證交所 OpenAPI 抓取全市場上市行情
+    # 1. 抓取證交所三大法人明細（拆解外資、投信、自營商與合計大戶買賣超）
     try:
-        twse_url = "https://twse.com.tw"
-        twse_data = fetch_json(twse_url)
-        
-        inst_map = {}
-        try:
-            t86_list = fetch_json("https://twse.com.tw")
-            for row in t86_list:
-                code = str(row.get("Code", "")).strip()
-                raw_net = str(row.get("TotalInstitutionalInvestorsNetBuySell", "0")).replace(",", "").strip()
-                net_buy = int(float(raw_net)) if raw_net and raw_net != "--" else 0
-                inst_map[code] = round(net_buy / 1000, 1)
-        except Exception as e:
-            print("三大法人暫無資料:", e)
+        for row in fetch_json("https://twse.com.tw"):
+            code = str(row.get("Code", "")).strip()
+            foreign_net = parse_lots(row.get("ForeignInvestorsNetBuySell", 0))
+            trust_net = parse_lots(row.get("InvestmentTrustNetBuySell", 0))
+            total_net = parse_lots(row.get("TotalInstitutionalInvestorsNetBuySell", 0))
+            inst_map[code] = {
+                "foreign": foreign_net,
+                "trust": trust_net,
+                "total": total_net
+            }
+    except Exception as e:
+        print("三大法人資料暫無更新:", e)
 
+    # 2. 抓取證交所全市場上市行情並結合籌碼初篩
+    try:
+        twse_data = fetch_json("https://twse.com.tw")
         for item in twse_data:
             code = str(item.get("Code", "")).strip()
             name = str(item.get("Name", "")).strip()
@@ -50,33 +57,36 @@ def main():
                 o_str = str(item.get("OpeningPrice", "0")).replace(",", "").strip()
                 v_str = str(item.get("TradeVolume", "0")).replace(",", "").strip()
                 chg_str = str(item.get("Change", "0")).replace("+", "").replace("X", "0").replace(",", "").strip()
-                
                 if not c_str or c_str == "--" or not o_str or o_str == "--":
                     continue
                 close_p = float(c_str)
                 open_p = float(o_str)
                 vol_lots = int(float(v_str)) // 1000
                 change_p = float(chg_str) if chg_str and chg_str != "--" else 0.0
-                
                 prev_close = close_p - change_p
                 pct_change = round((change_p / prev_close) * 100, 2) if prev_close > 0 else 0
 
-                if close_p > open_p and pct_change >= 0.8 and vol_lots >= 1500:
+                chip = inst_map.get(code, {"foreign": 0, "trust": 0, "total": 0})
+                
+                # 排除法人大舉倒貨（賣超超過 1500 張）的股票，避免拉高出貨陷阱
+                if chip["total"] < -1500:
+                    continue
+
+                # 收紅K且成交量 >= 1000 張進入技術指標精算
+                if close_p >= open_p and pct_change >= 0 and vol_lots >= 1000:
                     candidates.append({
-                        "code": code,
-                        "name": name,
-                        "close": close_p,
-                        "pct": pct_change,
-                        "vol": vol_lots,
-                        "inst_net": inst_map.get(code, 0)
+                        "code": code, "name": name, "close": close_p,
+                        "pct": pct_change, "vol": vol_lots,
+                        "foreign_net": chip["foreign"],
+                        "trust_net": chip["trust"],
+                        "inst_net": chip["total"]
                     })
             except Exception:
                 continue
-        print(f"證交所資料解析成功，初篩出 {len(candidates)} 檔活躍股")
     except Exception as e:
-        print("證交所連線異常，改用備援觀察池:", e)
+        print("證交所行情抓取異常:", e)
 
-    # 若證交所維護或連不上，自動啟用台股主流 50 檔核心觀察池（絕無假資料）
+    # 備援熱門觀察池
     if not candidates:
         backup_pool = [
             ("2330","台積電"),("2317","鴻海"),("2454","聯發科"),("2382","廣達"),("3231","緯創"),
@@ -91,10 +101,15 @@ def main():
             ("2408","南亞科"),("2344","華邦電"),("3034","聯詠"),("2379","瑞昱"),("5347","世界")
         ]
         for c, n in backup_pool:
-            candidates.append({"code": c, "name": n, "close": 0, "pct": 0, "vol": 0, "inst_net": 0})
+            chip = inst_map.get(c, {"foreign": 0, "trust": 0, "total": 0})
+            candidates.append({
+                "code": c, "name": n, "close": 0, "pct": 0, "vol": 0,
+                "foreign_net": chip["foreign"], "trust_net": chip["trust"], "inst_net": chip["total"]
+            })
 
-    candidates.sort(key=lambda x: (x["vol"], x["pct"]), reverse=True)
-    top_candidates = candidates[:55]
+    # 優先排序：有法人大戶買超 ＋ 成交量活躍的標的優先進行歷史 K 線精算
+    candidates.sort(key=lambda x: (x["inst_net"] > 300, x["vol"], x["pct"]), reverse=True)
+    top_candidates = candidates[:65]
 
     start_date = (now_tw - timedelta(days=100)).strftime("%Y-%m-%d")
     zhu_lin_picks = []
@@ -121,7 +136,7 @@ def main():
             curr_v = vols[-1]
             pct = round(((curr_c - prev_c) / prev_c) * 100, 2) if prev_c > 0 else 0
 
-            if curr_c <= curr_o or pct < 0.5 or curr_v < 1000:
+            if curr_c < curr_o or curr_v < 800:
                 continue
 
             stock["close"] = curr_c
@@ -140,46 +155,64 @@ def main():
             variance = sum((p - ma20) ** 2 for p in closes[-20:]) / 20
             std20 = math.sqrt(variance)
             bb_upper = ma20 + 2 * std20
-            bb_width = (4 * std20) / ma20 if ma20 > 0 else 0
 
-            prev_var = sum((p - prev_ma20) ** 2 for p in closes[-21:-1]) / 20
-            prev_std = math.sqrt(prev_var)
-            prev_bb_width = (4 * prev_std) / prev_ma20 if prev_ma20 > 0 else 0
+            # 建立外資 / 投信 / 大戶籌碼標籤
+            chip_tags = []
+            f_net = stock["foreign_net"]
+            t_net = stock["trust_net"]
+            tot_net = stock["inst_net"]
 
-            tags = []
-            if stock["inst_net"] > 300:
-                tags.append(f"法人買超{int(stock['inst_net'])}張")
+            if f_net > 0 and t_net > 0 and (f_net + t_net) >= 300:
+                chip_tags.append("土洋同步買超")
+            if f_net >= 500:
+                chip_tags.append(f"外資大買{int(f_net)}張")
+            elif f_net >= 150:
+                chip_tags.append(f"外資買超{int(f_net)}張")
+            if t_net >= 100:
+                chip_tags.append(f"投信認養{int(t_net)}張")
+            if tot_net >= 800:
+                chip_tags.append(f"法人大戶掃貨{int(tot_net)}張")
 
-            # 朱家泓 / 林穎：站上三線 + 底底高 + 成交量放大
-            recent_low = min(lows[-5:])
-            prior_low = min(lows[-15:-5])
-            if curr_c > ma5 and curr_c > ma10 and curr_c > ma20 and recent_low >= prior_low and curr_v >= vol_ma5 * 1.2:
-                z_tags = list(tags) + ["一陽站上三線", "底底高結構"]
+            # 籌碼過濾條件：必須具備「外資買超 > 100張」或「投信買超 > 50張」或「三大法人合計買超 > 200張」
+            has_big_player = (f_net >= 100) or (t_net >= 50) or (tot_net >= 200)
+            if not has_big_player:
+                continue
+
+            # 【策略 A：朱家泓 / 林穎 ＋ 大戶籌碼】站上 5MA 與 20MA 多頭起漲，且量增
+            if curr_c >= ma5 and curr_c >= ma20 and curr_v >= vol_ma5 * 1.05:
+                z_tags = list(chip_tags) + ["站穩月線多頭"]
+                if curr_c > ma10 and prev_c <= ma10:
+                    z_tags.append("一陽穿三線")
+                if min(lows[-5:]) >= min(lows[-15:-5]):
+                    z_tags.append("底底高結構")
                 if curr_c > ma60:
-                    z_tags.append("站穩季線")
+                    z_tags.append("季線之上")
                 zhu_lin_picks.append({**stock, "ma5": round(ma5, 2), "ma20": round(ma20, 2), "tags": z_tags})
 
-            # 莎拉形態學：5MA/20MA 金包銀 + 布林開口向上
-            golden_cross = (prev_ma5 <= prev_ma20 and ma5 > ma20) or (ma5 > ma20 and (ma5 - ma20) / ma20 <= 0.04)
-            if golden_cross and curr_c > ma20 and bb_width > prev_bb_width:
-                s_tags = list(tags) + ["5MA/20MA金包銀", "布林開口向上"]
-                if curr_c >= bb_upper * 0.98:
-                    s_tags.append("沿上軌強攻")
+            # 【策略 B：莎拉形態學 ＋ 大戶籌碼】5MA/20MA 金包銀多頭結構，站穩布林中軌之上
+            if ma5 >= ma20 and curr_c >= ma20:
+                s_tags = list(chip_tags) + ["5MA/20MA金包銀"]
+                if prev_ma5 <= prev_ma20:
+                    s_tags.append("剛黃金交叉")
+                if curr_c >= bb_upper * 0.96:
+                    s_tags.append("挑戰布林上軌")
                 sarah_picks.append({**stock, "ma5": round(ma5, 2), "ma20": round(ma20, 2), "tags": s_tags})
 
         except Exception:
             continue
 
+    # 排序：法人買超張數越多、漲幅越強排越前面
+    zhu_lin_picks.sort(key=lambda x: (x["inst_net"], x["pct"]), reverse=True)
+    sarah_picks.sort(key=lambda x: (x["inst_net"], x["pct"]), reverse=True)
+
     output = {
         "updated_at": f"{market_date} (系統更新 {now_tw.strftime('%H:%M')})",
-        "zhu_lin_picks": zhu_lin_picks[:12],
-        "sarah_picks": sarah_picks[:12]
+        "zhu_lin_picks": zhu_lin_picks[:10],
+        "sarah_picks": sarah_picks[:10]
     }
 
     with open("recommendations.json", "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
-    
-    print(f"執行完畢！朱林策略：{len(zhu_lin_picks)} 檔，莎拉策略：{len(sarah_picks)} 檔。")
 
 if __name__ == "__main__":
     main()
